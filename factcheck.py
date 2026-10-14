@@ -85,7 +85,7 @@ class AlwaysEntailedFactChecker(FactChecker):
 
 
 class WordRecallThresholdFactChecker(FactChecker):
-    def __init__(self, threshold: float = 0.5, use_nltk: bool = True,
+    def __init__(self, threshold: float = 0.65, use_nltk: bool = True,
                  remove_stopwords: bool = True, use_stemming: bool = True):
         # Threshold is kept as a field so we can tune it later from one place
         # rather than hunting through the predict() body. Default 0.5 is a
