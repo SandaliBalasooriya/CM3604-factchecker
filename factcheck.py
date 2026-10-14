@@ -82,10 +82,48 @@ class AlwaysEntailedFactChecker(FactChecker):
 
 
 class WordRecallThresholdFactChecker(FactChecker):
+    def __init__(self, threshold: float = 0.5):
+        # Threshold is kept as a field so we can tune it later from one place
+        # rather than hunting through the predict() body. Default 0.5 is a
+        # starting guess; we will sweep this once the baseline runs end-to-end.
+        self.threshold = threshold
     def predict(self, fact: str, passages: List[dict]) -> str:
-        raise Exception("Implement me")
+        # Step 1: break the fact into a set of words.
+        # Lowercase so "American" and "american" count as the same token.
+        # Using a set rather than a list means repeated words only count once,
+        # which matches the standard recall definition on word types.
+        fact_words = set(fact.lower().split())
 
+        # Step 2: for each passage, compute the recall of the fact's words.
+        # We take the max rather than the mean because a fact only needs ONE
+        # supporting passage. Averaging would unfairly punish a fact that is
+        # strongly supported by passage 1 but unrelated to passages 2 and 3.
+        best_score = 0.0
+        for passage in passages:
+            # passage is a dict like {"title": "...", "text": "..."} - we only
+            # need "text". The brief tells us the title is not useful here.
+            passage_words = set(passage["text"].lower().split())
 
+            # Recall = how many of the fact's words appear in this passage,
+            # divided by the total number of fact words. Range: 0.0 to 1.0.
+            # Guard against division by zero in case the fact is empty.
+            if len(fact_words) == 0:
+                score = 0.0
+            else:
+                overlap = fact_words & passage_words
+                score = len(overlap) / len(fact_words)
+
+            if score > best_score:
+                best_score = score
+                
+        # Step 3: convert the real-valued score into a binary S/NS decision.
+        # If enough of the fact's words were found in the best passage,
+        # we treat the fact as supported. Otherwise, not supported.
+        # The threshold itself is tuned on the dev set later (see sweep script).
+        if best_score >= self.threshold:
+            return "S"
+        else:
+            return "NS"
 class EntailmentFactChecker(FactChecker):
     def __init__(self, ent_model):
         self.ent_model = ent_model
