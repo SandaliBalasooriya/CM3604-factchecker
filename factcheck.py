@@ -5,6 +5,9 @@ from typing import List
 import numpy as np
 import spacy
 import gc
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
 
 
 class FactExample(object):
@@ -82,17 +85,66 @@ class AlwaysEntailedFactChecker(FactChecker):
 
 
 class WordRecallThresholdFactChecker(FactChecker):
-    def __init__(self, threshold: float = 0.5):
+    def __init__(self, threshold: float = 0.5, use_nltk: bool = True,
+                 remove_stopwords: bool = True, use_stemming: bool = True):
         # Threshold is kept as a field so we can tune it later from one place
         # rather than hunting through the predict() body. Default 0.5 is a
         # starting guess; we will sweep this once the baseline runs end-to-end.
         self.threshold = threshold
+
+        # Toggles for the preprocessing experiments. Keeping these as flags
+        # (rather than hard-coding one choice) lets us switch each step on and
+        # off from the driver and measure its individual impact. The results
+        # of that ablation go in the report comparison table.
+        self.use_nltk = use_nltk
+        self.remove_stopwords = remove_stopwords
+        self.use_stemming = use_stemming
+
+        # Load the stopword set once per instance rather than on every predict()
+        # call — looking it up is cheap but still worth caching since predict
+        # runs 221 times. Set-based membership check is O(1).
+        self.stopword_set = set(stopwords.words("english"))
+
+        # Porter stemmer is stateless so one instance is reused across all calls.
+        self.stemmer = PorterStemmer()
+
+    def preprocess(self, text: str) -> set:
+        # One function handles tokenisation, stopword removal and stemming
+        # based on the toggles set in __init__. Returning a set here (rather
+        # than later in predict) keeps the preprocessing logic in one place.
+
+        # Step A: lowercase. Still a sensible default even with better
+        # tokenisation — Wikipedia starts sentences with capitals that would
+        # otherwise mismatch mid-passage occurrences of the same word.
+        text = text.lower()
+
+        # Step B: tokenise. NLTK handles punctuation properly
+        # ("Cleveland." -> ["Cleveland", "."]), which plain split does not.
+        # The toggle lets us compare both for the experiment table.
+        if self.use_nltk:
+            tokens = nltk.word_tokenize(text)
+        else:
+            tokens = text.split()
+
+        # Step C: drop stopwords and bare punctuation. Stopwords like "is",
+        # "the", "has" inflate recall by matching every passage; punctuation
+        # tokens from NLTK (".", ",") carry no meaning either.
+        if self.remove_stopwords:
+            tokens = [t for t in tokens if t not in self.stopword_set and t.isalnum()]
+
+        # Step D: stem. Reduces morphological variants to a shared root so
+        # "invented", "inventing", "invention" all collapse to "invent".
+        # Helps when the fact and the passage use different word forms.
+        if self.use_stemming:
+            tokens = [self.stemmer.stem(t) for t in tokens]
+
+        # Return as a set — recall is defined on word types, not tokens.
+        return set(tokens)
+    
     def predict(self, fact: str, passages: List[dict]) -> str:
-        # Step 1: break the fact into a set of words.
-        # Lowercase so "American" and "american" count as the same token.
-        # Using a set rather than a list means repeated words only count once,
-        # which matches the standard recall definition on word types.
-        fact_words = set(fact.lower().split())
+        # Step 1: run the fact through the shared preprocessing pipeline
+        # (tokenise -> drop stopwords -> stem, controlled by the toggles).
+        fact_words = self.preprocess(fact)
 
         # Step 2: for each passage, compute the recall of the fact's words.
         # We take the max rather than the mean because a fact only needs ONE
@@ -100,13 +152,15 @@ class WordRecallThresholdFactChecker(FactChecker):
         # strongly supported by passage 1 but unrelated to passages 2 and 3.
         best_score = 0.0
         for passage in passages:
-            # passage is a dict like {"title": "...", "text": "..."} - we only
-            # need "text". The brief tells us the title is not useful here.
-            passage_words = set(passage["text"].lower().split())
+            # Same preprocessing applied to passage text so both sides of the
+            # overlap use the same vocabulary. The brief tells us to use
+            # "text" and ignore "title".
+            passage_words = self.preprocess(passage["text"])
 
-            # Recall = how many of the fact's words appear in this passage,
-            # divided by the total number of fact words. Range: 0.0 to 1.0.
-            # Guard against division by zero in case the fact is empty.
+            # Recall = how many of the fact's (cleaned) words appear in the
+            # passage, divided by the total number of cleaned fact words.
+            # Guard against division by zero in case preprocessing removed
+            # every word (e.g. an all-stopword fact — unlikely but defensive).
             if len(fact_words) == 0:
                 score = 0.0
             else:
@@ -115,11 +169,10 @@ class WordRecallThresholdFactChecker(FactChecker):
 
             if score > best_score:
                 best_score = score
-                
+
         # Step 3: convert the real-valued score into a binary S/NS decision.
-        # If enough of the fact's words were found in the best passage,
-        # we treat the fact as supported. Otherwise, not supported.
-        # The threshold itself is tuned on the dev set later (see sweep script).
+        # If enough of the fact's cleaned words were found in the best passage,
+        # we treat the fact as supported. Threshold is swept separately.
         if best_score >= self.threshold:
             return "S"
         else:
