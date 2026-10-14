@@ -5,6 +5,10 @@ from typing import List
 import numpy as np
 import spacy
 import gc
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+from rouge_score import rouge_scorer
 
 
 class FactExample(object):
@@ -82,10 +86,166 @@ class AlwaysEntailedFactChecker(FactChecker):
 
 
 class WordRecallThresholdFactChecker(FactChecker):
+    def __init__(self, threshold: float = 0.65, use_nltk: bool = True,
+                 remove_stopwords: bool = True, use_stemming: bool = True, 
+                 scorer: str = "recall"):
+        # Threshold is kept as a field so we can tune it later from one place
+        # rather than hunting through the predict() body. Default 0.5 is a
+        # starting guess; we will sweep this once the baseline runs end-to-end.
+        self.threshold = threshold
+
+        # Toggles for the preprocessing experiments. Keeping these as flags
+        # (rather than hard-coding one choice) lets us switch each step on and
+        # off from the driver and measure its individual impact. The results
+        # of that ablation go in the report comparison table.
+        self.use_nltk = use_nltk
+        self.remove_stopwords = remove_stopwords
+        self.use_stemming = use_stemming
+
+        # Which overlap metric to use. Options: "recall", "jaccard", "f1",
+        # "rouge". Default is "recall" because our class name is literally
+        # WordRecallThresholdFactChecker and the sweep showed it works well
+        # here — the fact/passage size mismatch disadvantages Jaccard and F1,
+        # which both penalise differences in set size. Alternatives are
+        # exposed so the report can compare them side-by-side.
+        self.scorer = scorer
+
+        # Load the stopword set once per instance rather than on every predict()
+        # call — looking it up is cheap but still worth caching since predict
+        # runs 221 times. Set-based membership check is O(1).
+        self.stopword_set = set(stopwords.words("english"))
+
+        # Porter stemmer is stateless so one instance is reused across all calls.
+        self.stemmer = PorterStemmer()
+
+    def preprocess(self, text: str) -> set:
+        # One function handles tokenisation, stopword removal and stemming
+        # based on the toggles set in __init__. Returning a set here (rather
+        # than later in predict) keeps the preprocessing logic in one place.
+
+        # Step A: lowercase. Still a sensible default even with better
+        # tokenisation — Wikipedia starts sentences with capitals that would
+        # otherwise mismatch mid-passage occurrences of the same word.
+        text = text.lower()
+
+        # Step B: tokenise. NLTK handles punctuation properly
+        # ("Cleveland." -> ["Cleveland", "."]), which plain split does not.
+        # The toggle lets us compare both for the experiment table.
+        if self.use_nltk:
+            tokens = nltk.word_tokenize(text)
+        else:
+            tokens = text.split()
+
+        # Step C: drop stopwords and bare punctuation. Stopwords like "is",
+        # "the", "has" inflate recall by matching every passage; punctuation
+        # tokens from NLTK (".", ",") carry no meaning either.
+        if self.remove_stopwords:
+            tokens = [t for t in tokens if t not in self.stopword_set and t.isalnum()]
+
+        # Step D: stem. Reduces morphological variants to a shared root so
+        # "invented", "inventing", "invention" all collapse to "invent".
+        # Helps when the fact and the passage use different word forms.
+        if self.use_stemming:
+            tokens = [self.stemmer.stem(t) for t in tokens]
+
+        # Return as a set — recall is defined on word types, not tokens.
+        return set(tokens)
+
+    def _compute_score(self, fact_words: set, passage_words: set,
+                       fact_text: str, passage_text: str) -> float:
+        # Returns a real-valued overlap score in [0, 1] using the metric
+        # chosen by self.scorer. Four metrics are supported so the report
+        # can compare them side-by-side; "recall" is our chosen final metric.
+        #
+        # Both the pre-tokenised sets AND the raw text strings are passed
+        # in because ROUGE wants to tokenise the strings itself (it has its
+        # own tokeniser and would get confused by stemmed tokens like
+        # "marri" that aren't real words).
+
+        # Empty fact -> no information to match on, treat as unsupported.
+        if len(fact_words) == 0:
+            return 0.0
+
+        overlap = fact_words & passage_words
+
+        if self.scorer == "recall":
+            # Recall = fraction of the fact's words appearing in the passage.
+            # Only cares about fact coverage — passage size doesn't matter.
+            return len(overlap) / len(fact_words)
+
+        elif self.scorer == "jaccard":
+            # Jaccard = intersection over union of the two word sets.
+            # Fair when the two sets are similar in size; here passages are
+            # much larger than facts, so Jaccard scores will be very small
+            # even for genuine matches. We expect this to underperform.
+            union = fact_words | passage_words
+            return len(overlap) / len(union) if len(union) > 0 else 0.0
+
+        elif self.scorer == "f1":
+            # F1 = harmonic mean of precision and recall.
+            # Precision = how many of the passage's words are in the fact
+            # (always tiny here because passages are long).
+            # Same size-mismatch problem as Jaccard, included for completeness.
+            if len(passage_words) == 0:
+                return 0.0
+            precision = len(overlap) / len(passage_words)
+            recall = len(overlap) / len(fact_words)
+            if precision + recall == 0:
+                return 0.0
+            return 2 * precision * recall / (precision + recall)
+
+        elif self.scorer == "rouge":
+            # ROUGE-1 from the rouge-score library. We feed it the raw strings
+            # (not our preprocessed sets) because its own tokeniser handles
+            # casing and punctuation internally, and stemmed tokens would
+            # confuse it. Returns a precision/recall/f-measure triple;
+            # we take f-measure as the comparable single number.
+            scorer = rouge_scorer.RougeScorer(["rouge1"], use_stemmer=True)
+            result = scorer.score(fact_text, passage_text)
+            return result["rouge1"].fmeasure
+
+        else:
+            # Fail loudly on a typo rather than silently defaulting.
+            raise ValueError(
+                f"Unknown scorer: {self.scorer!r}. "
+                f"Expected one of: 'recall', 'jaccard', 'f1', 'rouge'."
+            )
+    
     def predict(self, fact: str, passages: List[dict]) -> str:
-        raise Exception("Implement me")
+        # Step 1: run the fact through the shared preprocessing pipeline
+        # (tokenise -> drop stopwords -> stem, controlled by the toggles).
+        fact_words = self.preprocess(fact)
 
+        # Step 2: for each passage, compute an overlap score using whichever
+        # scoring method is configured (recall / jaccard / f1 / rouge).
+        # We take the max rather than the mean because a fact only needs ONE
+        # supporting passage. Averaging would unfairly punish a fact that is
+        # strongly supported by passage 1 but unrelated to passages 2 and 3.
+        best_score = 0.0
+        for passage in passages:
+            # Preprocess the passage text the same way as the fact so both
+            # sides share a vocabulary. The brief tells us to use "text" and
+            # ignore "title".
+            passage_text = passage["text"]
+            passage_words = self.preprocess(passage_text)
 
+            # _compute_score needs both the preprocessed sets AND the raw
+            # strings — most scorers use the sets, but ROUGE wants to do its
+            # own tokenisation on the originals.
+            score = self._compute_score(fact_words, passage_words,
+                                        fact, passage_text)
+
+            if score > best_score:
+                best_score = score
+
+        # Step 3: convert the real-valued score into a binary S/NS decision.
+        # Threshold is tuned per scorer (see threshold_sweep.py) because
+        # different metrics live on different numeric ranges — a Jaccard of
+        # 0.1 might be a strong match while a recall of 0.1 is weak.
+        if best_score >= self.threshold:
+            return "S"
+        else:
+            return "NS"
 class EntailmentFactChecker(FactChecker):
     def __init__(self, ent_model):
         self.ent_model = ent_model
