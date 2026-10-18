@@ -32,32 +32,58 @@ class FactExample(object):
 
 class EntailmentModel(object):
     def __init__(self, model, tokenizer, cuda=False):
+        # Reuse the model and tokenizer already loaded by the driver.
+        # This avoids loading a new model for every prediction.
         self.model = model
         self.tokenizer = tokenizer
         self.cuda = cuda
 
-    def check_entailment(self, premise: str, hypothesis: str):
+        # Set prediction behaviour, including disabling training-time dropout.
+        self.model.eval()
+
+        # Read the entailment position from the model's actual configuration.
+        self.entailment_index = self.model.config.label2id["entailment"]
+
+    def check_entailment(self, premise: str, hypothesis: str) -> float:
+        # Disable gradient tracking because we are predicting, not training.
         with torch.no_grad():
-            # Tokenize the premise and hypothesis
-            inputs = self.tokenizer(premise, hypothesis, return_tensors='pt', truncation=True, padding=True)
+            # Encode evidence first and claim second.
+            # Limit the combined input to 512 tokens, including special tokens.
+            inputs = self.tokenizer(
+                premise,
+                hypothesis,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
+            )
+
+            # Match the inputs to the GPU when the driver uses --cuda.
             if self.cuda:
-                inputs = {key: value.to('cuda') for key, value in inputs.items()}
-            # Get the model's prediction
+                inputs = {
+                    key: value.to("cuda")
+                    for key, value in inputs.items()
+                }
+
+            # Run the model and obtain its three raw class scores.
             outputs = self.model(**inputs)
             logits = outputs.logits
 
-        # Note that the labels are ["entailment", "neutral", "contradiction"]. There are a number of ways to map
-        # these logits or probabilities to classification decisions; you'll have to decide how you want to do this.
+            # Convert logits into probabilities across the three classes.
+            probabilities = torch.softmax(logits, dim=-1)
 
-        raise Exception("Not implemented")
+            # Select the first input pair's entailment probability.
+            # .item() converts the single tensor value into a Python number.
+            entailment_probability = probabilities[
+                0, self.entailment_index
+            ].item()
 
-        # To prevent out-of-memory (OOM) issues during autograding, we explicitly delete
-        # objects inputs, outputs, logits, and any results that are no longer needed after the computation.
-        del inputs, outputs, logits
+        # Release references to temporary tensors before returning.
+        # The returned Python number does not retain these tensors.
+        del inputs, outputs, logits, probabilities
         gc.collect()
 
-        # return something
-
+        return entailment_probability
 
 class FactChecker(object):
     """
@@ -247,13 +273,59 @@ class WordRecallThresholdFactChecker(FactChecker):
         else:
             return "NS"
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model):
+    def __init__(self, ent_model, threshold: float = 0.5):
+        # Reuse the entailment wrapper supplied by the driver.
         self.ent_model = ent_model
 
+        # This is an initial cutoff, to be evaluated later.
+        # The default keeps the original driver's constructor call working.
+        self.threshold = threshold
+
+    def score_fact(self, fact: str, passages: List[dict]) -> float:
+        # Track the strongest support found across all evidence sentences.
+        # Starting at zero also handles an empty list of passages.
+        best_score = 0.0
+
+        for passage in passages:
+            # Normalize whitespace without removing meaningful words,
+            # punctuation, dates, numbers or negation.
+            text = " ".join(passage["text"].split())
+
+            # Empty passages contain no evidence to evaluate.
+            if not text:
+                continue
+
+            # Break the passage into individual evidence sentences.
+            sentences = nltk.sent_tokenize(text)
+
+            for sentence in sentences:
+                sentence = sentence.strip()
+
+                if not sentence:
+                    continue
+
+                # Evidence is the premise; the fact is the hypothesis.
+                # Process one pair at a time to limit batch memory use.
+                score = self.ent_model.check_entailment(
+                    premise=sentence,
+                    hypothesis=fact
+                )
+
+                # One supporting sentence can establish support.
+                # Unrelated sentences should not dilute its score.
+                best_score = max(best_score, score)
+
+        return best_score
+
     def predict(self, fact: str, passages: List[dict]) -> str:
-        raise Exception("Implement me")
+        # Obtain the highest entailment probability across the evidence.
+        best_score = self.score_fact(fact, passages)
 
+        # Convert the numerical score into the labels expected by the driver.
+        if best_score >= self.threshold:
+            return "S"
 
+        return "NS"
 # OPTIONAL
 class DependencyRecallThresholdFactChecker(FactChecker):
     def __init__(self):
