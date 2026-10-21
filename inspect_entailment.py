@@ -96,3 +96,39 @@ for description, passages, expected in checker_examples:
     assert prediction == expected, (
         f"{description}: expected {expected}, got {prediction}"
     )
+
+# Summarize filtering during the complete-checker tests.
+print("Evidence sentences:", checker.total_sentences)
+print("Pruned sentences:", checker.pruned_sentences)
+print("DeBERTa calls:", checker.model_calls)
+
+# Every evidence sentence must be either skipped or evaluated.
+assert checker.total_sentences == (
+    checker.pruned_sentences + checker.model_calls
+)
+
+# Record the counters before testing clearly unrelated evidence.
+before_pruned = checker.pruned_sentences
+before_calls = checker.model_calls
+
+# This sentence shares no content words with the birthplace claim.
+unrelated_passages = [
+    {
+        "title": "Example",
+        "text": "Volcanoes release molten rock."
+    }
+]
+
+prediction = checker.predict(
+    "Maya was born in London.",
+    unrelated_passages
+)
+
+print("Zero-overlap prediction:", prediction)
+
+# The sentence should be filtered without calling DeBERTa.
+assert prediction == "NS"
+assert checker.pruned_sentences == before_pruned + 1
+assert checker.model_calls == before_calls
+
+print("Zero-overlap pruning check passed.")

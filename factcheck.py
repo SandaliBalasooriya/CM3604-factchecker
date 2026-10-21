@@ -273,60 +273,107 @@ class WordRecallThresholdFactChecker(FactChecker):
         else:
             return "NS"
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model, threshold: float = 0.5):
-        # Reuse the entailment wrapper supplied by the driver.
+    def __init__(
+        self,
+        ent_model,
+        threshold: float = 0.38,
+        pruning_threshold: float = 0.05,
+        use_pruning: bool = True
+    ):
+        # Reuse the entailment model loaded by the original driver.
         self.ent_model = ent_model
 
-        # This is an initial cutoff, to be evaluated later.
-        # The default keeps the original driver's constructor call working.
+        # This cutoff converts the final entailment score into S or NS.
         self.threshold = threshold
 
+        # This separate cutoff filters weak evidence before model inference.
+        # Start at 0.1, then evaluate its accuracy and runtime.
+        self.pruning_threshold = pruning_threshold
+        self.use_pruning = use_pruning
+
+        # Reuse Part 1's existing preprocessing and recall scoring.
+        # We do not change its code or call its S/NS prediction method.
+        self.overlap_checker = (
+            WordRecallThresholdFactChecker(scorer="recall")
+            if use_pruning
+            else None
+        )
+
+        # These counters measure how much evidence reaches DeBERTa.
+        self.total_sentences = 0
+        self.pruned_sentences = 0
+        self.model_calls = 0
+
     def score_fact(self, fact: str, passages: List[dict]) -> float:
-        # Track the strongest support found across all evidence sentences.
-        # Starting at zero also handles an empty list of passages.
+        # No evidence means no support has been established.
         best_score = 0.0
 
+        # Preprocess the claim once for overlap comparisons.
+        fact_words = (
+            self.overlap_checker.preprocess(fact)
+            if self.use_pruning
+            else None
+        )
+
         for passage in passages:
-            # Normalize whitespace without removing meaningful words,
-            # punctuation, dates, numbers or negation.
+            # Normalize whitespace while preserving the original meaning.
             text = " ".join(passage["text"].split())
 
-            # Empty passages contain no evidence to evaluate.
             if not text:
                 continue
 
-            # Break the passage into individual evidence sentences.
-            sentences = nltk.sent_tokenize(text)
-
-            for sentence in sentences:
+            # Evaluate individual evidence sentences.
+            for sentence in nltk.sent_tokenize(text):
                 sentence = sentence.strip()
 
                 if not sentence:
                     continue
 
-                # Evidence is the premise; the fact is the hypothesis.
-                # Process one pair at a time to limit batch memory use.
+                self.total_sentences += 1
+
+                # If preprocessing leaves no claim tokens, avoid pruning:
+                # there is no useful lexical basis for filtering.
+                if self.use_pruning and fact_words:
+                    sentence_words = (
+                        self.overlap_checker.preprocess(sentence)
+                    )
+
+                    # Calculate recall using Part 1's existing method.
+                    overlap_score = (
+                        self.overlap_checker._compute_score(
+                            fact_words,
+                            sentence_words,
+                            fact,
+                            sentence
+                        )
+                    )
+
+                    if overlap_score < self.pruning_threshold:
+                        self.pruned_sentences += 1
+
+                        # Skip only this sentence; continue checking others.
+                        continue
+
+                # DeBERTa receives natural text, not stemmed tokens.
                 score = self.ent_model.check_entailment(
                     premise=sentence,
                     hypothesis=fact
                 )
+                self.model_calls += 1
 
-                # One supporting sentence can establish support.
-                # Unrelated sentences should not dilute its score.
+                # Retain the strongest support across the evidence.
                 best_score = max(best_score, score)
 
         return best_score
 
     def predict(self, fact: str, passages: List[dict]) -> str:
-        # Obtain the highest entailment probability across the evidence.
+        # Convert the maximum evidence score into the driver's expected label.
         best_score = self.score_fact(fact, passages)
 
-        # Convert the numerical score into the labels expected by the driver.
         if best_score >= self.threshold:
             return "S"
 
         return "NS"
-# OPTIONAL
 class DependencyRecallThresholdFactChecker(FactChecker):
     def __init__(self):
         self.nlp = spacy.load('en_core_web_sm')
