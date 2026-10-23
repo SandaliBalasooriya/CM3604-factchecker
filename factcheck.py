@@ -32,32 +32,58 @@ class FactExample(object):
 
 class EntailmentModel(object):
     def __init__(self, model, tokenizer, cuda=False):
+        # Reuse the model and tokenizer already loaded by the driver.
+        # This avoids loading a new model for every prediction.
         self.model = model
         self.tokenizer = tokenizer
         self.cuda = cuda
 
-    def check_entailment(self, premise: str, hypothesis: str):
+        # Set prediction behaviour, including disabling training-time dropout.
+        self.model.eval()
+
+        # Read the entailment position from the model's actual configuration.
+        self.entailment_index = self.model.config.label2id["entailment"]
+
+    def check_entailment(self, premise: str, hypothesis: str) -> float:
+        # Disable gradient tracking because we are predicting, not training.
         with torch.no_grad():
-            # Tokenize the premise and hypothesis
-            inputs = self.tokenizer(premise, hypothesis, return_tensors='pt', truncation=True, padding=True)
+            # Encode evidence first and claim second.
+            # Limit the combined input to 512 tokens, including special tokens.
+            inputs = self.tokenizer(
+                premise,
+                hypothesis,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
+            )
+
+            # Match the inputs to the GPU when the driver uses --cuda.
             if self.cuda:
-                inputs = {key: value.to('cuda') for key, value in inputs.items()}
-            # Get the model's prediction
+                inputs = {
+                    key: value.to("cuda")
+                    for key, value in inputs.items()
+                }
+
+            # Run the model and obtain its three raw class scores.
             outputs = self.model(**inputs)
             logits = outputs.logits
 
-        # Note that the labels are ["entailment", "neutral", "contradiction"]. There are a number of ways to map
-        # these logits or probabilities to classification decisions; you'll have to decide how you want to do this.
+            # Convert logits into probabilities across the three classes.
+            probabilities = torch.softmax(logits, dim=-1)
 
-        raise Exception("Not implemented")
+            # Select the first input pair's entailment probability.
+            # .item() converts the single tensor value into a Python number.
+            entailment_probability = probabilities[
+                0, self.entailment_index
+            ].item()
 
-        # To prevent out-of-memory (OOM) issues during autograding, we explicitly delete
-        # objects inputs, outputs, logits, and any results that are no longer needed after the computation.
-        del inputs, outputs, logits
+        # Release references to temporary tensors before returning.
+        # The returned Python number does not retain these tensors.
+        del inputs, outputs, logits, probabilities
         gc.collect()
 
-        # return something
-
+        return entailment_probability
 
 class FactChecker(object):
     """
@@ -247,14 +273,107 @@ class WordRecallThresholdFactChecker(FactChecker):
         else:
             return "NS"
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model):
+    def __init__(
+        self,
+        ent_model,
+        threshold: float = 0.38,
+        pruning_threshold: float = 0.05,
+        use_pruning: bool = True
+    ):
+        # Reuse the entailment model loaded by the original driver.
         self.ent_model = ent_model
 
+        # This cutoff converts the final entailment score into S or NS.
+        self.threshold = threshold
+
+        # This separate cutoff filters weak evidence before model inference.
+        # Start at 0.1, then evaluate its accuracy and runtime.
+        self.pruning_threshold = pruning_threshold
+        self.use_pruning = use_pruning
+
+        # Reuse Part 1's existing preprocessing and recall scoring.
+        # We do not change its code or call its S/NS prediction method.
+        self.overlap_checker = (
+            WordRecallThresholdFactChecker(scorer="recall")
+            if use_pruning
+            else None
+        )
+
+        # These counters measure how much evidence reaches DeBERTa.
+        self.total_sentences = 0
+        self.pruned_sentences = 0
+        self.model_calls = 0
+
+    def score_fact(self, fact: str, passages: List[dict]) -> float:
+        # No evidence means no support has been established.
+        best_score = 0.0
+
+        # Preprocess the claim once for overlap comparisons.
+        fact_words = (
+            self.overlap_checker.preprocess(fact)
+            if self.use_pruning
+            else None
+        )
+
+        for passage in passages:
+            # Normalize whitespace while preserving the original meaning.
+            text = " ".join(passage["text"].split())
+
+            if not text:
+                continue
+
+            # Evaluate individual evidence sentences.
+            for sentence in nltk.sent_tokenize(text):
+                sentence = sentence.strip()
+
+                if not sentence:
+                    continue
+
+                self.total_sentences += 1
+
+                # If preprocessing leaves no claim tokens, avoid pruning:
+                # there is no useful lexical basis for filtering.
+                if self.use_pruning and fact_words:
+                    sentence_words = (
+                        self.overlap_checker.preprocess(sentence)
+                    )
+
+                    # Calculate recall using Part 1's existing method.
+                    overlap_score = (
+                        self.overlap_checker._compute_score(
+                            fact_words,
+                            sentence_words,
+                            fact,
+                            sentence
+                        )
+                    )
+
+                    if overlap_score < self.pruning_threshold:
+                        self.pruned_sentences += 1
+
+                        # Skip only this sentence; continue checking others.
+                        continue
+
+                # DeBERTa receives natural text, not stemmed tokens.
+                score = self.ent_model.check_entailment(
+                    premise=sentence,
+                    hypothesis=fact
+                )
+                self.model_calls += 1
+
+                # Retain the strongest support across the evidence.
+                best_score = max(best_score, score)
+
+        return best_score
+
     def predict(self, fact: str, passages: List[dict]) -> str:
-        raise Exception("Implement me")
+        # Convert the maximum evidence score into the driver's expected label.
+        best_score = self.score_fact(fact, passages)
 
+        if best_score >= self.threshold:
+            return "S"
 
-# OPTIONAL
+        return "NS"
 class DependencyRecallThresholdFactChecker(FactChecker):
     def __init__(self):
         self.nlp = spacy.load('en_core_web_sm')
