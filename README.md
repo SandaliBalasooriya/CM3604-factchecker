@@ -38,23 +38,18 @@ Group coursework for CM3604 Deep Learning (Robert Gordon University). Fact-check
 
 Note: this is a 0.0.1 patch deviation from the pinned `torch==2.5.0` — document in report if used.
 
-## Verify it works
-python factchecking_main.py --mode word_overlap
-
-
-Should fail with `Exception: Implement me` from `factcheck.py` line 86 — that's expected. It means the framework loads the 221 examples correctly and reaches the stub we need to implement.
-
 ## Running the two modes
 
-Once implemented:
-		python factchecking_main.py --mode word_overlap
-		python factchecking_main.py --mode entailment
-		
+    python factchecking_main.py --mode word_overlap   # 179/221 = 81.0%  (target 75%)
+    python factchecking_main.py --mode entailment     # 187/221 = 84.6%  (target 83%), ~2-3 min on CPU
 
 Add `--cuda` to the entailment command if PyTorch is installed with CUDA support.
+Missing NLTK data (punkt, punkt_tab, stopwords) is downloaded automatically on first run.
 
 ## File structure
 
-- `factcheck.py` — all implementations go here (do not touch `factchecking_main.py`)
+- `factcheck.py` — Part 1 (`WordRecallThresholdFactChecker`) and Part 2 (`EntailmentModel`, `EntailmentFactChecker`); `factchecking_main.py` is the unmodified framework driver
 - `data/` — the labelled dev set and retrieved Wikipedia passages
 - `requirements.txt` — pinned package versions (Python 3.10)
+- `report/` — experiment scripts and results behind the written report's tables, and the entailment error export used for Part 3
+- `threshold_sweep.py`, `evaluate_entailment.py`, `inspect_entailment.py`, `results/` — development experiments (not needed to run the two modes)
