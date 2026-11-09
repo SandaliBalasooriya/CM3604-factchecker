@@ -15,19 +15,17 @@ from factcheck import WordRecallThresholdFactChecker
 from factchecking_main import read_passages, read_fact_examples
 
 def evaluate(fact_checker, examples):
-    # Runs the given fact_checker over every example (skipping IR as the main
-    # driver does) and returns accuracy as a float in [0, 1]. Kept separate
-    # from the sweep loop so we can reuse it for other experiments later
-    # (preprocessing ablation, alternative scorers).
+    # Runs the given fact_checker over every example and returns accuracy as
+    # a float in [0, 1]. Kept separate from the sweep loop so we can reuse it
+    # for other experiments (preprocessing ablation, alternative scorers).
     correct = 0
     total = 0
     for ex in examples:
-        # The brief says IR (irrelevant) labels are ignored during scoring,
-        # so we match that convention — only S and NS examples count.
-        if ex.label not in ("S", "NS"):
-            continue
+        # Match the driver (predict_two_classes): IR (irrelevant) facts are
+        # scored as NS rather than skipped, so all 221 examples count.
+        gold = "NS" if ex.label == "IR" else ex.label
         prediction = fact_checker.predict(ex.fact, ex.passages)
-        if prediction == ex.label:
+        if prediction == gold:
             correct += 1
         total += 1
     return correct / total if total > 0 else 0.0
