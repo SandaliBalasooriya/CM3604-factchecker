@@ -32,8 +32,8 @@ TABLE_PATH = RESULTS_DIR / "entailment_pruning_005_thresholds.csv"
 
 
 def file_hash(path):
-    # Fingerprint files so changed code or data cannot silently reuse old scores.
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    # line‑ending normalization
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def main():
